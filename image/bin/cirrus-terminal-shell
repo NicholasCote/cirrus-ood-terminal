@@ -1,0 +1,53 @@
+#!/bin/bash
+#
+# What ttyd runs for every browser tab: the user's own login shell, started the
+# way sshd starts one on Casper or Derecho.
+#
+#   * the shell is the one from their directory entry (CIRRUS_TERMINAL_LOGIN_SHELL,
+#     filled in by submit.yml.erb), so a tcsh user gets tcsh;
+#   * it is a LOGIN shell, so it reads /etc/profile and ~/.profile (bash, ksh),
+#     ~/.bash_profile or ~/.bash_login if they exist (bash), /etc/csh.login,
+#     ~/.tcshrc and ~/.login (tcsh), /etc/zprofile and ~/.zprofile (zsh) --
+#     exactly the files the NCAR docs tell people to put their settings in;
+#   * it starts in $HOME;
+#   * /etc/motd is printed first unless ~/.hushlogin exists, which is the
+#     convention login(1) and sshd follow.
+#
+# A login shell is signalled the traditional way, with a leading "-" in
+# argv[0], rather than with -l. tcsh honours -l only when it is the only
+# argument, and argv[0] works the same for every shell.
+#
+# Usage: cirrus-terminal-shell             interactive login shell
+#        cirrus-terminal-shell -c COMMAND  the same shell, running COMMAND
+#                                          (used by image/test/acceptance.sh)
+
+want="${CIRRUS_TERMINAL_LOGIN_SHELL:-bash}"
+want="${want##*/}"
+note=""
+case "$want" in
+    bash|sh)  sh=/bin/bash ;;
+    tcsh|csh) sh=/bin/tcsh ;;
+    zsh)      sh=/bin/zsh ;;
+    ksh)      sh=/bin/ksh ;;
+    *)        sh=/bin/bash
+              note="Your login shell (${want}) is not installed here; this is bash." ;;
+esac
+if [ ! -x "$sh" ]; then
+    note="Your login shell (${sh}) is missing from this image; this is bash."
+    sh=/bin/bash
+fi
+export SHELL="$sh"
+
+cd "$HOME" 2>/dev/null || cd /
+
+if [ "${1:-}" = "-c" ]; then
+    shift
+    exec -a "-${sh##*/}" "$sh" -c "$*"
+fi
+
+if [ ! -e "$HOME/.hushlogin" ] && [ -r /etc/motd ]; then
+    cat /etc/motd
+fi
+[ -z "$note" ] || printf '%s\n\n' "$note"
+
+exec -a "-${sh##*/}" "$sh"

@@ -1,0 +1,15 @@
+# CIRRUS Terminal: SUSE's /etc/bash.bashrc sources this at its end, for every
+# interactive bash, before the user's ~/.bashrc.
+#
+# The prompt. SUSE's default -- the one Casper and Derecho show,
+# user@derecho4:~> -- is built from \u@\h, and \h here would be the pod's name,
+# a long generated string that tells nobody anything. The hostname is replaced
+# with a fixed, recognisable name so the prompt says where you are. Only the
+# default is touched; a PS1 the user sets in ~/.bashrc or ~/.profile wins.
+case "$-" in
+    *i*)
+        if [ -n "${CIRRUS_TERMINAL_PROMPT_HOST:-}" ]; then
+            PS1="${PS1//\\h/${CIRRUS_TERMINAL_PROMPT_HOST}}"
+        fi
+        ;;
+esac

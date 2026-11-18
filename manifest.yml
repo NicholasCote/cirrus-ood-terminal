@@ -1,0 +1,17 @@
+---
+name: Terminal (CIRRUS)
+category: Interactive Apps
+subcategory: Servers
+role: batch_connect
+description: |
+  This app opens a shell in your browser, running in a container on the CIRRUS
+  Kubernetes cluster with your GLADE home and the same file systems as the
+  other CIRRUS apps mounted.
+
+  It is set up to feel like logging in to Casper or Derecho: openSUSE Leap 15
+  (the same OS family), your own login shell reading your own `~/.profile` or
+  `~/.tcshrc`, Lmod's `module` command, and `$WORK` and `$SCRATCH` set as they
+  are there.
+
+  `ssh` and `bao-getkey` are included: run `bao-getkey` once, then `ssh derecho`
+  or `ssh casper` without the two-factor prompt.

@@ -1,0 +1,28 @@
+---
+cluster: "cirrus"
+
+form:
+  - cpu
+  - memory
+
+attributes:
+  cpu:
+    widget: number_field
+    label: "CPUs"
+    min: 1
+    max: 8
+    value: 1
+    step: 1
+    required: true
+    help: |
+      A shell is idle almost all of the time; this is for what you run in it.
+      One is plenty for moving files around and editing.
+
+  memory:
+    widget: number_field
+    label: "Memory (GB)"
+    min: 1
+    max: 32
+    value: 4
+    step: 1
+    required: true

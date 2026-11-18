@@ -1,0 +1,15 @@
+<%- cpus = user_context["cpu"].to_s.strip -%>
+<%- mem  = user_context["memory"].to_s.strip -%>
+<%- unless cpus.empty? || mem.empty? -%>
+**Resources:** <%= cpus %> CPU<%= "s" unless cpus == "1" %>, <%= mem %> GB
+<%- end -%>
+
+Each browser tab is its own login shell, and closing the tab ends it — the same
+as closing an ssh connection. Use `tmux` or `screen` for anything that has to
+outlive the tab.
+
+Run `bao-getkey` once per session, then `ssh derecho` or `ssh casper` (and
+`qsub` there) without the two-factor prompt.
+
+The session ends itself an hour after the last tab is closed, so closing your
+tabs releases the CPU and memory rather than holding them.

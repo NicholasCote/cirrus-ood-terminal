@@ -1,0 +1,7 @@
+# CIRRUS Terminal: SUSE's /etc/csh.cshrc sources this at its end, before the
+# user's ~/.tcshrc. The tcsh twin of /etc/bash.bashrc.local: SUSE's default
+# prompt with %m (the pod's generated name) replaced by a fixed one. A prompt
+# the user sets in ~/.tcshrc wins.
+if ( $?prompt && $?CIRRUS_TERMINAL_PROMPT_HOST ) then
+    set prompt="%B${CIRRUS_TERMINAL_PROMPT_HOST}%b %C2%# "
+endif

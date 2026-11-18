@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# What is actually in this image. `terminal-versions` prints the record made at
+# build time; `terminal-versions --check` re-resolves each component and diffs
+# against it, because a base-image rebuild can change every one of these while
+# the Dockerfile stays byte-identical.
+
+set -uo pipefail
+
+RECORD="${CIRRUS_TERMINAL_HOME:-/opt/cirrus-terminal}/versions.txt"
+
+rpmv() { rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null; }
+
+resolve() {
+    case "$1" in
+        base-image)      sed -n 's/^base-image\t//p' "$RECORD" ;;   # build-time only
+        leap)            (. /etc/os-release; printf '%s' "${VERSION_ID}") ;;
+        glibc)           ldd --version | head -1 | awk '{print $NF}' ;;
+        ttyd)            ttyd --version 2>/dev/null | awk '{print $3}' ;;
+        bash|tcsh|zsh|ksh|lua-lmod|openssh-clients|git|gcc|python3)
+                         rpmv "$1" ;;
+        bao-getkey)      sha256sum /usr/local/bin/bao-getkey | awk '{print $1}' ;;
+        *)               printf '' ;;
+    esac
+}
+
+if [ ! -r "$RECORD" ]; then
+    printf 'terminal-versions: %s is missing; this is not a CIRRUS terminal image.\n' \
+           "$RECORD" >&2
+    exit 1
+fi
+
+if [ "${1:-}" != "--check" ]; then
+    cat "$RECORD"
+    exit 0
+fi
+
+rc=0
+while IFS="$(printf '\t')" read -r name want; do
+    case "$name" in ''|\#*) continue ;; esac
+    got="$(resolve "$name" 2>/dev/null || true)"
+    if [ "$got" = "$want" ]; then
+        printf 'ok   %-16s %s\n' "$name" "$want"
+    else
+        printf 'DIFF %-16s recorded=%s actual=%s\n' "$name" "$want" "${got:-<unresolved>}"
+        rc=1
+    fi
+done < "$RECORD"
+exit "$rc"

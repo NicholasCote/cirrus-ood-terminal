@@ -1,0 +1,132 @@
+<%-
+  # ---------------------------------------------------------------------------
+  # This line is REWRITTEN BY CI: .github/workflows/build.yml builds image/,
+  # smoke-tests it, pushes it and commits the new tag here. Until the first
+  # build of main has run, this tag does not exist and a launch fails with
+  # ImagePullBackOff.
+  terminal_img = "hub.k8s.ucar.edu/ncote/cirrus-terminal:unbuilt"
+
+  utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
+
+  user = OodSupport::User.new
+
+  idle_timeout = 3600
+  idle_check_interval = 300
+
+  max_session_hours = 12
+
+  # Validated here, not just by the form's min/max: the browser's limits are
+  # advisory, and these values end up in the pod spec. Ranges match form.yml.
+  whole_number = lambda do |label, raw, range|
+    s = raw.to_s.strip
+    unless s.match?(/\A\d{1,3}\z/) && range.cover?(s.to_i)
+      raise "#{label} must be a whole number from #{range.min} to #{range.max}, got #{raw.to_s.inspect}."
+    end
+    s.to_i
+  end
+  cpus = whole_number.call("CPUs", cpu, 1..8)
+  memory_gb = whole_number.call("Memory (GB)", memory, 1..32)
+
+  # The user's own login shell, from the same directory Casper and Derecho read
+  # it from, so a tcsh user gets tcsh here too. Only the basename crosses into
+  # the pod, and only one the image knows: the path on the HPC side means
+  # nothing in the container, and anything else falls back to bash, which is
+  # the HPC default for new accounts as well.
+  login_shell = begin
+                  File.basename(Etc.getpwnam(user.name).shell.to_s)
+                rescue StandardError
+                  ""
+                end
+  login_shell = "bash" unless %w[bash sh tcsh csh zsh ksh].include?(login_shell)
+
+  base_url_file = "base_url"
+
+  passwd_file = "csenv"
+-%>
+---
+batch_connect:
+  template: "basic"
+script:
+  wall_time: "<%= max_session_hours * 3600 %>"
+  native:
+    container:
+      name: "cirrus-terminal"
+      image: "<%= terminal_img %>"
+      command: "/usr/local/bin/entrypoint.sh terminal"
+      restart_policy: "OnFailure"
+      working_dir: "<%= user.home %>"
+      env:
+        HOME: "<%= user.home %>"
+        USER: "<%= user.name %>"
+        NB_USER: "<%= user.name %>"
+        GROUP: "<%= user.group.name %>"
+
+        CIRRUS_TERMINAL_LOGIN_SHELL: "<%= login_shell %>"
+
+        CIRRUS_TERMINAL_PORT: "8080"
+
+        CIRRUS_TERMINAL_AUTH: "password"
+        CIRRUS_TERMINAL_PASSWORD_FILE: "/ood/<%= passwd_file %>"
+
+        CIRRUS_TERMINAL_BASE_URL_FILE: "/ood/<%= base_url_file %>"
+
+        CIRRUS_TERMINAL_IDLE_TIMEOUT: "<%= idle_timeout %>"
+        CIRRUS_TERMINAL_IDLE_CHECK: "<%= idle_check_interval %>"
+        CIRRUS_TERMINAL_MAX_LIFETIME: "<%= max_session_hours * 3600 %>"
+      port: 8080
+      cpu: "<%= cpus %>"
+      memory: "<%= memory_gb %>Gi"
+      startup_probe:
+        initial_delay_seconds: 5
+        failure_threshold: 60
+        period_seconds: 5
+    mounts:
+      - type: nfs
+        name: home
+        host: "gladenfs.hpc.ucar.edu"
+        path: "/gpfs/u/home/<%= user.name %>"
+        destination_path: "<%= user.home %>"
+      - type: nfs
+        name: campaign
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1"
+        destination_path: /glade/campaign
+      - type: nfs
+        name: gdex
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/collections/gdex"
+        destination_path: /gdex
+      - type: nfs
+        name: collections
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/collections"
+        destination_path: /glade/collections
+      - type: nfs
+        name: work
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/work"
+        destination_path: /glade/work
+    configmap:
+      files:
+        - filename: "<%= passwd_file %>"
+          mount_path: "/ood"
+          data: |
+        - filename: "<%= base_url_file %>"
+          data: |
+    init_containers:
+      - name: "init-secret"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/save_passwd_as_secret"
+      - name: "add-passwd-to-cfg"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/bash"
+          - "-c"
+          - "source /bin/passwd_from_secret; kubectl patch configmap $(hostname)-configmap --type=merge -p 'data: {<%= passwd_file %>: password='$PASSWORD'}'"
+      - name: "add-baseurl-to-cfg"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/bash"
+          - "-c"
+          - "PORT_CFG=$(kubectl get services $(hostname)-service -o jsonpath='{.spec.ports[0].nodePort}'); HOST_CFG=$(kubectl get pods $(hostname) -o jsonpath='{.spec.nodeName}'); kubectl patch configmap $(hostname)-configmap --type=merge -p 'data: {<%= base_url_file %>: /rnode/'$HOST_CFG'/'$PORT_CFG'/}'"

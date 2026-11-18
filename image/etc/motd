@@ -1,0 +1,7 @@
+
+ CIRRUS Terminal -- openSUSE Leap 15, the same OS family as Casper and Derecho.
+ Mounted: your home, /glade/work, /glade/campaign, /glade/collections, /gdex.
+ Not here: PBS (qsub/qstat), the NCAR module tree, /glade/derecho/scratch.
+ For those, run `bao-getkey` once, then `ssh derecho` or `ssh casper`.
+ (Create ~/.hushlogin to stop seeing this, as on any login node.)
+

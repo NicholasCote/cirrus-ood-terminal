@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+r"""Per-session password gate in front of ttyd.
+
+Why this exists
+---------------
+ttyd can authenticate on its own (`-c user:password`), but only with HTTP Basic,
+and that is the wrong shape of credential here for the same two reasons the
+sibling Ubuntu Desktop app found with KasmVNC:
+
+  * HTTP Basic is a header the browser sends only after its own native dialog.
+    The dashboard's Connect button is a form POST and cannot supply it, and the
+    user, who has already authenticated to OnDemand, would be asked to type a
+    second password.
+  * Browsers cache Basic credentials per ORIGIN, and every session on this site
+    shares the OnDemand origin, so two concurrent sessions would fight over one
+    cached credential.
+
+So this process holds the public port, turns one POST from the dashboard into a
+cookie, and relays to a ttyd that listens on loopback only and has no credential
+of its own. Nothing but this pod can reach loopback, and everything in this pod
+runs as the one user it belongs to.
+
+One request per connection, enforced HERE
+-----------------------------------------
+This is the main difference from the desktop gate. KasmVNC closes every
+connection after one response, so checking the first request head there IS
+checking every request. ttyd is built on libwebsockets, which honours HTTP/1.1
+keep-alive. If this gate checked the first request and then relayed bytes
+blindly, every later request on that connection would ride on the first one's
+cookie, and the client on the other end of that connection is OnDemand's Apache,
+which may reuse backend connections.
+
+So for anything that is not a websocket upgrade this gate:
+
+  * forwards only GET and HEAD (ttyd serves nothing else: the page, /token and
+    the /ws upgrade);
+  * rewrites the request's Connection header to `close`;
+  * relays the response, and never forwards another byte the client sends on
+    that connection;
+  * closes both sides when the upstream finishes.
+
+A pipelined second request is therefore never forwarded, whatever the upstream
+does with `Connection: close`. image/test/acceptance.sh sends two pipelined
+requests and requires exactly one response.
+
+A websocket upgrade is checked like any other request (a browser sends its
+cookies on the handshake) and is then a blind byte relay in both directions,
+because an upgraded connection is no longer HTTP.
+
+The websocket path needs no help
+--------------------------------
+The Ubuntu Desktop gate injects a `?path=` query parameter because KasmVNC's
+client builds its websocket URL root-absolutely. ttyd's does not: its client
+builds both URLs from window.location.pathname (html/src/components/app.tsx in
+ttyd 1.7.7):
+
+    const path = window.location.pathname.replace(/[/]+$/, '');
+    const wsUrl = [protocol, '//', window.location.host, path, '/ws', window.location.search].join('');
+    const tokenUrl = [window.location.protocol, '//', window.location.host, path, '/token'].join('');
+
+Behind /rnode/<node>/<port>/ that is wss://<ondemand>/rnode/<node>/<port>/ws,
+which the proxy strips to /ws. So this gate injects nothing. The acceptance test
+asserts that the served bundle still builds its URLs that way.
+
+Redirects and cookies stay unprefixed
+-------------------------------------
+OnDemand's /rnode/ block strips its prefix on the way in, and on the way out it
+prepends it to every Location and rewrites every cookie Path:
+
+    Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
+                         "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+    Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
+    Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+
+So the redirect after sign-in is plain "/" and the cookie Path is "/". The one
+string that needs the full prefix is the login form's action, because it is in
+a response body and bodies are not rewritten.
+
+Idle tracking
+-------------
+ttyd has no API that reports connected clients, so this gate counts open
+websocket relays and keeps the number in $CIRRUS_TERMINAL_STATE_DIR/clients. The
+file's mtime is when the count last changed. The entrypoint's watchdog reads it.
+
+Python 3.6, standard library only: this runs on the image's system python3,
+which is the SLES 15 / Leap 15 one, the same as on Casper and Derecho.
+"""
+
+import base64
+import hmac
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import urllib.parse
+
+PROG = "cirrus-terminal-gate"
+
+LISTEN_PORT = int(os.environ.get("CIRRUS_TERMINAL_PORT", "8080"))
+UPSTREAM_HOST = "127.0.0.1"
+UPSTREAM_PORT = int(os.environ.get("CIRRUS_TERMINAL_UPSTREAM_PORT", "7681"))
+ROOT_PATH = os.environ.get("CIRRUS_TERMINAL_ROOT_PATH", "/")
+STATE_DIR = os.environ.get("CIRRUS_TERMINAL_STATE_DIR", "/tmp/cirrus-terminal")
+PASSWORD_FILE = os.environ.get(
+    "CIRRUS_TERMINAL_PASSWORD_FILE_RESOLVED", os.path.join(STATE_DIR, "session-password")
+)
+CLIENTS_FILE = os.path.join(STATE_DIR, "clients")
+
+COOKIE_NAME = "cirrus_terminal_gate"
+SIGNIN_PATH = "cirrus-signin"
+
+# The head of an HTTP request is small; anything larger than this before the
+# blank line is not a request we should be forwarding.
+MAX_HEAD = 64 * 1024
+RELAY_CHUNK = 65536
+# How long a plain HTTP response may go quiet before it is given up on. ttyd's
+# responses are a page, a token and nothing else, all from memory; this only
+# matters if the upstream keeps a connection open after its response.
+RESPONSE_IDLE_SECS = 30
+
+# Hop-by-hop headers that are ours to decide on a forwarded plain request.
+HOP_BY_HOP = ("connection", "keep-alive", "proxy-connection", "te", "upgrade")
+
+
+def log(msg):
+    print("%s: %s" % (PROG, msg), file=sys.stderr, flush=True)
+
+
+def read_password():
+    try:
+        with open(PASSWORD_FILE) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        log("cannot read %s: %s" % (PASSWORD_FILE, exc))
+        return ""
+
+
+# One token per process. It is what the cookie carries, so the password itself
+# is never stored in the browser and a token from a previous pod is worthless.
+SESSION_TOKEN = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+
+# --- open terminal count, for the idle watchdog -----------------------------
+
+_clients_lock = threading.Lock()
+_clients = 0
+
+
+def _write_clients(n):
+    tmp = CLIENTS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("%d\n" % n)
+        os.replace(tmp, CLIENTS_FILE)
+    except OSError as exc:
+        # Not fatal for the session, but the watchdog then reads a stale count.
+        # It treats a missing file as "connected", so the failure mode is a
+        # session that is not culled, never one culled while in use.
+        log("cannot update %s: %s" % (CLIENTS_FILE, exc))
+
+
+def clients_changed(delta):
+    global _clients
+    with _clients_lock:
+        _clients = max(0, _clients + delta)
+        _write_clients(_clients)
+        return _clients
+
+
+# --- HTTP pieces --------------------------------------------------------------
+
+def http_response(status, body, extra_headers=()):
+    body_bytes = body.encode("utf-8")
+    head = [
+        "HTTP/1.1 %s" % status,
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Length: %d" % len(body_bytes),
+        "Cache-Control: no-store",
+        "X-Content-Type-Options: nosniff",
+        "Connection: close",
+    ]
+    head.extend(extra_headers)
+    return ("\r\n".join(head) + "\r\n\r\n").encode("utf-8") + body_bytes
+
+
+LOGIN_PAGE = """<!doctype html>
+<title>Terminal &middot; CIRRUS</title>
+<style>
+ body {{ font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 30rem;
+        color: #1a1a1a; background: #fff; }}
+ form {{ display: flex; gap: .5rem; margin: 1.5rem 0; }}
+ input[type=password] {{ flex: 1; padding: .5rem; font-size: 1rem; }}
+ button {{ padding: .5rem 1rem; font-size: 1rem; }}
+ p.err {{ color: #a00; }}
+ p.note {{ color: #555; font-size: .9rem; }}
+</style>
+<h1>Terminal</h1>
+{message}
+<form method="post" action="{action}">
+  <input type="password" name="password" autofocus placeholder="Session password">
+  <button type="submit">Connect</button>
+</form>
+<p class="note">You should not normally see this page. This session has its own
+password, generated when it launched, and the <b>Open Terminal</b> button on the
+OnDemand dashboard sends it for you &mdash; go back there and use it rather than
+typing anything here.</p>
+"""
+
+
+def login_page(action, error=None):
+    message = '<p class="err">%s</p>' % error if error else ""
+    return LOGIN_PAGE.format(message=message, action=action)
+
+
+def parse_head(head):
+    """Return (method, target, headers-dict-lowercased, lines). Malformed -> None."""
+    try:
+        text = head.decode("latin-1")
+    except UnicodeDecodeError:
+        return None
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+        return None
+    method, target = parts[0], parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        # Repeated headers are joined the way the RFC says to, which matters for
+        # Cookie: browsers may send it more than once.
+        name = name.strip().lower()
+        value = value.strip()
+        if name in headers:
+            headers[name] = headers[name] + "; " + value
+        else:
+            headers[name] = value
+    return method, target, headers, lines
+
+
+def has_valid_cookie(headers):
+    raw = headers.get("cookie", "")
+    for item in raw.split(";"):
+        name, _, value = item.strip().partition("=")
+        if name == COOKIE_NAME:
+            # compare_digest, not ==: the token is a secret and a timing
+            # difference on a 43-character comparison is a real oracle.
+            if hmac.compare_digest(value, SESSION_TOKEN):
+                return True
+    return False
+
+
+def is_upgrade(headers):
+    return (
+        headers.get("upgrade", "").lower() == "websocket"
+        and "upgrade" in [t.strip().lower() for t in headers.get("connection", "").split(",")]
+    )
+
+
+def closing_head(lines):
+    """The request head for a plain request: one request, then close."""
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if not line:
+            continue
+        if line.split(":", 1)[0].strip().lower() in HOP_BY_HOP:
+            continue
+        kept.append(line)
+    kept.append("Connection: close")
+    return "\r\n".join(kept).encode("latin-1")
+
+
+def normalised_root():
+    """The prefix the browser sees, with exactly one trailing slash.
+
+    For the login form's action only. Never for a Location or a cookie Path --
+    the proxy adds the prefix to both itself.
+    """
+    root = ROOT_PATH if ROOT_PATH.startswith("/") else "/" + ROOT_PATH
+    return root if root.endswith("/") else root + "/"
+
+
+SIGNIN_URL = normalised_root() + SIGNIN_PATH
+
+
+def signin_target(raw):
+    """Where to send the browser after a correct password, as the APP sees it.
+
+    Root-relative and unprefixed, always. A caller-supplied `to` is honoured
+    only if it is a single-slash-rooted path: "//host/..." and "/\\host/..."
+    send a browser to another origin, and CR or LF would be a header injection,
+    so all three are refused rather than sanitised.
+    """
+    if (
+        raw.startswith("/")
+        and not raw.startswith("//")
+        and not raw.startswith("/\\")
+        and "\r" not in raw
+        and "\n" not in raw
+    ):
+        return raw
+    return "/"
+
+
+def is_signin_request(target):
+    """Matched on the suffix: /rnode/ strips its prefix and /node/ would not."""
+    return target.split("?", 1)[0].endswith("/" + SIGNIN_PATH)
+
+
+def read_head(sock):
+    """Read up to and including the blank line. Returns (head, leftover)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > MAX_HEAD:
+            return None, b""
+        try:
+            chunk = sock.recv(RELAY_CHUNK)
+        except OSError:
+            return None, b""
+        if not chunk:
+            return None, b""
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head, rest
+
+
+def read_body(sock, headers, already):
+    length = headers.get("content-length", "")
+    if not re.fullmatch(r"\d{1,6}", length):
+        return already
+    length = int(length)
+    body = already
+    while len(body) < length:
+        try:
+            chunk = sock.recv(min(RELAY_CHUNK, length - len(body)))
+        except OSError:
+            break
+        if not chunk:
+            break
+        body += chunk
+    return body[:length]
+
+
+def close_quietly(*socks):
+    for sock in socks:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def connect_upstream(client):
+    try:
+        upstream = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=10)
+    except OSError as exc:
+        log("cannot reach ttyd on %s:%d: %s" % (UPSTREAM_HOST, UPSTREAM_PORT, exc))
+        client.sendall(
+            http_response(
+                "502 Bad Gateway",
+                "<h1>The terminal server in this session is not running</h1>"
+                "<p>Delete this session from the OnDemand dashboard and launch a"
+                " new one.</p>",
+            )
+        )
+        return None
+    return upstream
+
+
+def proxy_once(client, lines):
+    """One plain request, one response, then both sides close."""
+    upstream = connect_upstream(client)
+    if upstream is None:
+        return
+    try:
+        upstream.sendall(closing_head(lines) + b"\r\n\r\n")
+        upstream.settimeout(RESPONSE_IDLE_SECS)
+        while True:
+            data = upstream.recv(RELAY_CHUNK)
+            if not data:
+                break
+            client.sendall(data)
+    except (OSError, socket.timeout):
+        pass
+    finally:
+        close_quietly(upstream)
+
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(RELAY_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Shut both down: when either side of a websocket goes, the terminal is
+        # gone, and the other thread must stop waiting.
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def proxy_upgrade(client, head, leftover):
+    """A websocket: the checked handshake, then a blind relay both ways."""
+    upstream = connect_upstream(client)
+    if upstream is None:
+        return
+    upstream.settimeout(None)
+    client.settimeout(None)
+    clients_changed(+1)
+    try:
+        upstream.sendall(head + b"\r\n\r\n" + leftover)
+        threads = [
+            threading.Thread(target=relay, args=(client, upstream), daemon=True),
+            threading.Thread(target=relay, args=(upstream, client), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    except OSError:
+        pass
+    finally:
+        clients_changed(-1)
+        close_quietly(upstream)
+
+
+def handle(client, addr):
+    try:
+        client.settimeout(60)
+        head, leftover = read_head(client)
+        if head is None:
+            return
+        parsed = parse_head(head)
+        if parsed is None:
+            client.sendall(http_response("400 Bad Request", "<h1>Bad request</h1>"))
+            return
+        method, target, headers, lines = parsed
+
+        if has_valid_cookie(headers):
+            if is_upgrade(headers):
+                proxy_upgrade(client, head, leftover)
+                return
+            if method not in ("GET", "HEAD"):
+                client.sendall(
+                    http_response("405 Method Not Allowed", "<h1>Method not allowed</h1>",
+                                  ("Allow: GET, HEAD",))
+                )
+                return
+            proxy_once(client, lines)
+            return
+
+        if method == "POST" and is_signin_request(target):
+            body = read_body(client, headers, leftover)
+            fields = urllib.parse.parse_qs(body.decode("latin-1", "replace"))
+            supplied = (fields.get("password") or [""])[0]
+            expected = read_password()
+            if expected and hmac.compare_digest(supplied, expected):
+                redirect = signin_target((fields.get("to") or [""])[0])
+                log("sign-in accepted from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "302 Found",
+                        '<a href="%s">Terminal</a>' % redirect,
+                        (
+                            "Location: %s" % redirect,
+                            # Path=/ and an unprefixed Location: the proxy
+                            # rewrites both to /rnode/<node>/<port>, which is
+                            # what scopes the cookie to this one session.
+                            "Set-Cookie: %s=%s; Path=/; HttpOnly; SameSite=Lax"
+                            % (COOKIE_NAME, SESSION_TOKEN),
+                        ),
+                    )
+                )
+            else:
+                log("sign-in refused from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "401 Unauthorized",
+                        login_page(SIGNIN_URL, "That is not this session's password."),
+                    )
+                )
+            return
+
+        # No cookie: the login form, with a status that matches what it is.
+        # Deliberately no WWW-Authenticate header -- that is what would summon
+        # the browser's own credential dialog.
+        status = "200 OK" if method == "GET" and not is_upgrade(headers) else "401 Unauthorized"
+        client.sendall(http_response(status, login_page(SIGNIN_URL)))
+    except OSError:
+        pass
+    finally:
+        close_quietly(client)
+
+
+def main():
+    if not read_password():
+        log("no session password is available; refusing to start.")
+        log("Every request would be rejected, which is worse than not starting:")
+        log("the pod would look healthy and no one could get in.")
+        return 1
+
+    _write_clients(0)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", LISTEN_PORT))
+    listener.listen(128)
+    log(
+        "listening on 0.0.0.0:%d, forwarding to ttyd on %s:%d (sign-in at %s)"
+        % (LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT, SIGNIN_URL)
+    )
+
+    while True:
+        try:
+            client, addr = listener.accept()
+        except OSError as exc:
+            log("accept failed: %s" % exc)
+            continue
+        threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
